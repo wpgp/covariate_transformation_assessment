@@ -1,0 +1,388 @@
+---
+title: "Covariate transformation"
+subtitle: "Simulation assessment"
+author: "Gianluca Boo"
+format: html
+ code-fold: true
+editor: visual
+---
+
+## Covariate Transform
+```{r project set up, echo=false}
+# load libraries
+library(tidyverse); library(data.table); library(MASS); library(energy); library(readr); library(sf); library(terra)
+
+# set seed
+set.seed(28)
+
+# 
+options(scipen=999)
+
+# data path
+data_path <- 
+  "~/Documents/GitHub/covariate_transformation/data/"
+
+# load ea data stack
+ea_stack <- 
+  data_path |> 
+  paste0("ea/ea_stack.csv") |> 
+  readr::read_csv(show_col_types = FALSE)
+
+# load grid data stack
+grid_stack <- 
+  data_path |> 
+  paste0("grid/grid_stack.csv") |> 
+  readr::read_csv(show_col_types = FALSE)
+```
+
+```{r covariate mean and sd, echo=false}
+# list the covariates name
+covariate_name <- 
+  grid_stack |> 
+  dplyr::select(-c(cell, x, y, cod_bld_area_20240617_unpublished, cod_bld_count_20240617_unpublished, ghs_smod_e2025_globe_r2023a_54009_1000_v2_0)) |> 
+  names()
+
+# compute mean and sd at the ea level
+ea_covariate_mean <- 
+  ea_stack |> 
+  dplyr::select(all_of(covariate_name)) |> 
+  dplyr::summarise(across(everything(), mean, na.rm = TRUE)) |> 
+  dplyr::rename_with(~ paste0("mean_", .), everything())
+ea_covariate_sd <-
+  ea_stack |> 
+  dplyr::select(all_of(covariate_name)) |> 
+  dplyr::summarise(across(everything(), sd, na.rm = TRUE)) |> 
+  dplyr::rename_with(~ paste0("sd_", .), everything())
+
+# compute mean and sd at the grid level
+grid_covariate_mean <-
+  grid_stack |> 
+  dplyr::select(all_of(covariate_name)) |> 
+  dplyr::summarise(across(everything(), mean, na.rm = TRUE)) |> 
+  dplyr::rename_with(~ paste0("mean_", .), everything())
+grid_covariate_sd <-
+  grid_stack |> 
+  dplyr::select(all_of(covariate_name)) |> 
+  dplyr::summarise(across(everything(), sd, na.rm = TRUE)) |> 
+  dplyr::rename_with(~ paste0("sd_", .), everything())
+
+```
+
+
+```{r compute z-score at ea level, echo=F}
+## compute the z-score for the covrariate in the ea stack ##
+# using ea mean and sd
+ea_stack_ea_zscore <- 
+  covariate_name |> 
+  map(function(covariate_unique){
+     z <- ea_stack |> 
+       dplyr::select(!!sym(covariate_unique))|> 
+       cbind(ea_covariate_mean) |> 
+       cbind(ea_covariate_sd) |> 
+       dplyr::select(ends_with(covariate_unique)) |> 
+       dplyr::mutate(!!sym(paste0("z_", covariate_unique)) := (!!sym(covariate_unique)-!!sym(paste0("mean_", covariate_unique)))/ !!sym(paste0("sd_", covariate_unique)))|> 
+    dplyr::select(!!sym(paste0(covariate_unique)) :=!!sym(paste0("z_", covariate_unique)))
+  return(z)
+  }) |> 
+  reduce(cbind) |> 
+  dplyr::mutate(ea_id=ea_stack |> dplyr::pull(ea_id),
+                people=ea_stack |> dplyr::pull(population_count),
+                building=ea_stack |> dplyr::pull(cod_buildings_count_bcb_gl_100m_v1_1),
+                density=people/building,
+                density_log=density |> log(),
+                .before=1) |> 
+   dplyr::filter(building>=1) |> 
+  dplyr::filter(density<=100)
+
+# using grid mean and sd
+ea_stack_grid_zscore <- 
+  covariate_name |> 
+  map(function(covariate_unique){
+     z <- ea_stack |> 
+    dplyr::select(!!sym(covariate_unique))|> 
+    cbind(grid_covariate_mean) |> 
+    cbind(grid_covariate_sd) |> 
+    dplyr::select(ends_with(covariate_unique)) |> 
+    dplyr::mutate(!!sym(paste0("z_", covariate_unique)) := 
+             (!!sym(covariate_unique)-!!sym(paste0("mean_", covariate_unique)))/
+             !!sym(paste0("sd_", covariate_unique)))|> 
+    dplyr::select(!!sym(paste0(covariate_unique)) :=!!sym(paste0("z_", covariate_unique)))
+  return(z)
+  }) |> 
+  reduce(cbind) |> 
+  dplyr::mutate(ea_id=ea_stack |> dplyr::pull(ea_id),
+                people=ea_stack |> dplyr::pull(population_count),
+                building=ea_stack |> dplyr::pull(cod_buildings_count_bcb_gl_100m_v1_1),
+                density=people/building,
+                density_log=density |> log(),
+                .before=1) |> 
+  dplyr::filter(building>=1) |> 
+  dplyr::filter(density<=100)
+  
+rm(ea_stack)
+gc()
+```
+Kolmogorov-Smirnov (KS) Test: The KS test compares the cumulative distribution functions of two datasets. It tests the null hypothesis that the two samples come from the same distribution. If the p-value is high, you fail to reject the null hypothesis (i.e., the distributions are similar).
+Mann-Whitney U Test (Wilcoxon Rank-Sum Test): This test compares two independent samples to assess whether they come from the same distribution, particularly focusing on differences in medians or ranks.
+
+```{r}
+ks_covariate <- 
+  covariate_name |> 
+  map(function(covariate_unique) {
+    ea_zscore <- ea_stack_ea_zscore |> dplyr::pull(!!sym(covariate_unique))
+    grid_zscore <- ea_stack_grid_zscore |> dplyr::pull(!!sym(covariate_unique))
+    ks_test <- ks.test(x=ea_zscore, y=grid_zscore)
+    energy_test <- energy::energy(ea_zscore, grid_zscore)
+    wilcox_test <- wilcox.test(ea_zscore, grid_zscore)
+    ks_test_covaraite <- data.frame(covariate=covariate_unique, ks_distance=ks_test$statistic |> unname(), ks_pvalue=ks_test$p.value)
+    return(ks_test_covaraite)
+  }) |> 
+  data.table::rbindlist()
+
+ea_stack_grid_zscore
+```
+
+```{r}
+
+## fit model with ea transformed covariates ##
+# create formula with all covariates
+ea_transformed_initial <- 
+  covariate_name |> 
+  length()
+ea_tranformed_significant <- 
+ea_transformed_initial - 1
+
+  formula_ea_transformed <- 
+  paste("density", "~", paste(covariate_name, collapse = " + ")) |> 
+  as.formula()
+
+  while(ea_transformed_initial!=ea_tranformed_significant) {
+# fit model with ea-transformed covariates
+glm_ea_transformed_all <- 
+  glm(formula=formula_ea_transformed, family = Gamma, data = ea_stack_ea_zscore)
+
+# extract significant covariates
+covariate_ea_transformed_all <- 
+  summary(glm_ea_transformed_all) |> 
+  _$coefficients |> 
+  as.data.frame() |> 
+  dplyr::filter(!is.na(Estimate)) |> 
+  rownames() |> _[-1]
+
+covariate_ea_transformed_significant <- 
+  summary(glm_ea_transformed_all) |> 
+  _$coefficients |> 
+  as.data.frame() |> 
+  dplyr::filter(!is.na(Estimate)) |> 
+  dplyr::filter(`Pr(>|t|)`<0.05)|> 
+  rownames() |> _[-1]
+
+formula_ea_transformed <- 
+  paste("density", "~", paste(covariate_ea_transformed_significant, collapse = " + ")) |> 
+  as.formula()
+
+ea_transformed_initial <- covariate_ea_transformed_all |> length()
+ea_tranformed_significant <-   covariate_ea_transformed_significant |> length()
+}
+
+summary(glm_ea_transformed_all)
+
+## fit model with grid transformed covariates ##
+# create formula with all covariates
+grid_transformed_initial <- 
+  covariate_name |> 
+  length()
+grid_tranformed_significant <- 
+grid_transformed_initial - 1
+
+  formula_grid_transformed <- 
+  paste("density", "~", paste(covariate_name, collapse = " + ")) |> 
+  as.formula()
+
+  while(grid_transformed_initial!=grid_tranformed_significant) {
+# fit model with ea-transformed covariates
+glm_grid_transformed_all <- 
+  glm(formula=formula_grid_transformed, family = Gamma, data = ea_stack_grid_zscore)
+
+# extract significant covariates
+covariate_grid_transformed_all <- 
+  summary(glm_grid_transformed_all) |> 
+  _$coefficients |> 
+  as.data.frame() |> 
+  dplyr::filter(!is.na(Estimate)) |> 
+  rownames() |> _[-1]
+
+covariate_grid_transformed_significant <- 
+  summary(glm_grid_transformed_all) |> 
+  _$coefficients |> 
+  as.data.frame() |> 
+  dplyr::filter(!is.na(Estimate)) |> 
+  dplyr::filter(`Pr(>|t|)`<0.05)|> 
+  rownames() |> _[-1]
+
+formula_grid_transformed <- 
+  paste("density", "~", paste(covariate_grid_transformed_significant, collapse = " + ")) |> 
+  as.formula()
+
+grid_transformed_initial <- covariate_grid_transformed_all |> length()
+grid_tranformed_significant <-   covariate_grid_transformed_significant |> length()
+}
+
+covariate_all_transformed_significant <-  
+  c(covariate_ea_transformed_significant, covariate_grid_transformed_significant) |> unique()
+
+summary(glm_grid_transformed_all)
+summary(glm_ea_transformed_all)
+
+```
+
+```{r}
+## compute the z-score for the covrariate in the grid stack ##
+# using ea mean and sd
+grid_stack_ea_zscore <- 
+  covariate_all_transformed_significant |> 
+  map(function(covariate_unique){
+     z <- grid_stack |> 
+    dplyr::select(!!sym(covariate_unique))|> 
+    cbind(ea_covariate_mean) |> 
+    cbind(ea_covariate_sd) |> 
+    dplyr::select(ends_with(covariate_unique)) |> 
+    dplyr::mutate(!!sym(paste0("z_", covariate_unique)) := 
+             (!!sym(covariate_unique)-!!sym(paste0("mean_", covariate_unique)))/
+             !!sym(paste0("sd_", covariate_unique)))|> 
+    dplyr::select(!!sym(paste0(covariate_unique)) :=!!sym(paste0("z_", covariate_unique)))
+  return(z)
+  }) |>
+  reduce(cbind) |> 
+  dplyr::mutate(cell=grid_stack |> dplyr::pull(cell), 
+                building=grid_stack |> dplyr::pull(cod_buildings_count_bcb_gl_100m_v1_1),
+                .before=1)
+  
+# using grid mean and sd
+grid_stack_grid_zscore <- 
+  covariate_all_transformed_significant |> 
+  map(function(covariate_unique){
+     z <- grid_stack |> 
+       dplyr::select(!!sym(covariate_unique))|> 
+       cbind(grid_covariate_mean) |> 
+       cbind(grid_covariate_sd) |> 
+       dplyr::select(ends_with(covariate_unique)) |> 
+       dplyr::mutate(!!sym(paste0("z_", covariate_unique)) := 
+             (!!sym(covariate_unique)-!!sym(paste0("mean_", covariate_unique)))/
+             !!sym(paste0("sd_", covariate_unique)))|> 
+       dplyr::select(!!sym(paste0(covariate_unique)) :=!!sym(paste0("z_", covariate_unique)))
+  return(z)
+  }) |>
+  reduce(cbind) |> 
+  dplyr::mutate(cell=grid_stack |> dplyr::pull(cell), 
+                building=grid_stack |> dplyr::pull(cod_buildings_count_bcb_gl_100m_v1_1),
+                .before=1)
+
+rm(grid_stack)
+rm(ea_covariate_mean, ea_covariate_sd, grid_covariate_mean, grid_covariate_sd)
+gc()
+```
+
+```{r}
+predict_ea_ea_transformed <- 
+  grid_stack_ea_zscore |> 
+  dplyr::select(cell, building) |> 
+  dplyr::mutate(density=predict(glm_ea_transformed_all, newdata=grid_stack_ea_zscore, type = "response"),
+                people=building*density,
+                fit="ea_transformed",
+                predict="ea_transformed")
+
+predict_ea_grid_transformed <- 
+  grid_stack_ea_zscore |> 
+  dplyr::select(cell, building) |> 
+  dplyr::mutate(density=predict(glm_ea_transformed_all, newdata=grid_stack_grid_zscore, type = "response"),
+                people=building*density,
+                fit="ea_transformed",
+                predict="grid_transformed")
+
+predict_grid_ea_transformed <- 
+  grid_stack_ea_zscore |> 
+  dplyr::select(cell, building) |> 
+  dplyr::mutate(density=predict(glm_grid_transformed_all, newdata=grid_stack_ea_zscore, type = "response"),
+                people=building*density,
+                fit="grid_transformed",
+                predict="ea_transformed")
+
+predict_grid_grid_transformed <-
+  grid_stack_ea_zscore |> 
+  dplyr::select(cell, building) |> 
+  dplyr::mutate(density=predict(glm_grid_transformed_all, newdata=grid_stack_grid_zscore, type = "response"),
+                people=building*density,
+                fit="grid_transformed",
+                predict="grid_transformed")
+
+
+predict <- 
+  predict_ea_ea_transformed |> 
+  rbind(predict_ea_grid_transformed) |> 
+  rbind(predict_grid_ea_transformed) |> 
+  rbind(predict_grid_grid_transformed)
+
+rm(predict_ea_ea_transformed, predict_ea_grid_transformed, predict_grid_ea_transformed, predict_grid_grid_transformed)
+
+```
+
+```{r}
+ggplot(data=predict, aes(x=people, y=building, col=density))+
+  geom_point()+
+  geom_smooth()+
+  theme_minimal()+
+  facet_grid(rows=vars(fit), cols=vars(predict), scales="free")
+
+ggplot(data=predict, aes(x=density, col=density))+
+  geom_histogram()+
+    theme_minimal()+
+  facet_grid(rows=vars(fit), cols=vars(predict), scales="free")
+
+predict |> 
+  group_by(fit, predict) |> 
+  summarize(sum=sum(people),
+            mean=mean(people),
+            median=median(people),
+            sd=sd(people),
+            iqr=IQR(people)) |> 
+  ungroup()
+```
+
+```{r}
+# load ea boundaries and data stack
+ea <- 
+  data_path |> 
+  paste0("ea/ea.gpkg") |> 
+  sf::st_read()
+
+grid <- 
+  data_path |> 
+  paste0("grid/grid.tif") |> 
+  terra::rast() |> 
+  terra::extract(y=vect(ea), ID=T) |> 
+  dplyr::filter(!is.na(mai_ndombe_cod_bld_count_20240617_unpublished)) |> 
+  dplyr::rename(cell=mai_ndombe_cod_bld_count_20240617_unpublished)
+
+grid_predict <- 
+  predict |> 
+  left_join(grid, by=join_by(cell)) |> 
+  group_by(ID, fit, predict) |> 
+  summarize(people_predict=people |> sum(na.rm=T)) |> 
+  ungroup()
+
+ea_predict <- 
+  ea_stack_ea_zscore |> 
+  dplyr::select(ea_id, people, building) |> 
+  dplyr::rename(ID=ea_id) |> 
+  dplyr::mutate(ID=1:n()) |> 
+  right_join(grid_predict, by=join_by(ID))
+```
+
+```{r}
+ggplot(data=ea_predict, aes(people, people_predict))+
+  geom_point()+
+  facet_grid(rows=vars(fit), cols=vars(predict))
+
+  
+```
